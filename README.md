@@ -17,6 +17,10 @@ In this project, we successfully built a fraud risk forecasting model using XGBo
 	3.	Future Fraud Prediction:
 	•	Extended the model to predict fraud risk for the next 8 weeks using an iterative approach.
 	•	The resulting forecast exhibits reasonable fluctuations, suggesting it has learned seasonality/trends.
+ 
+ <img width="764" alt="Screenshot 2025-03-23 at 11 19 11 AM" src="https://github.com/user-attachments/assets/3d2c7377-65cb-4a8d-9094-f04c72f9563f" />
+
+ 
  <img width="744" alt="Screenshot 2025-03-24 at 2 29 28 PM" src="https://github.com/user-attachments/assets/8c758e80-95c2-4b17-af49-e08847368913" />
  <img width="716" alt="Screenshot 2025-03-22 at 11 49 59 AM" src="https://github.com/user-attachments/assets/76b050c8-578c-4c5d-b1d7-9335c5296dc2" />
 <img width="737" alt="Screenshot 2025-03-22 at 11 55 32 AM" src="https://github.com/user-attachments/assets/68f35a35-1c68-4277-ad20-25aa90cfb762" />
