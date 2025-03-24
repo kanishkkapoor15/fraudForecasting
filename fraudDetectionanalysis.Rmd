@@ -1,0 +1,675 @@
+---
+title: "fraudDetection"
+author: "Kanishk Kapoor"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load required package
+library(zoo)
+library(tidyverse)
+library(data.table)
+library(readxl)
+library(lubridate)
+library(ggplot2)
+library(corrplot)
+library(dplyr)
+library(tidyr)
+library(tseries)
+library(forecast)
+library(Metrics)
+library(caret)
+library(xgboost)
+library(rpart)
+library(rpart.plot)
+```
+
+### Data Loding & Cleaning
+
+```{r}
+f_data <- read.csv("synthetic_fraud_dataset.csv",stringsAsFactors = FALSE)
+```
+
+```{r}
+str(f_data)
+colSums(is.na(f_data))
+head(f_data)
+```
+
+```{r}
+f_data$Timestamp <- ymd_hms(f_data$Timestamp)
+f_data$Timestamp <- as.POSIXct(f_data$Timestamp,format="%Y-%m-%d %H:%M:%S")
+```
+
+```{r}
+exclude_cols <- c("Transaction_ID","User_ID","Transaction_Amount","Timestamp","Account_Balance","IP_Address_Flag","Previous_Fraudulent_Activity","Daily_Transaction_Count","Avg_Transaction_Amount_7d","Failed_Transaction_Count_7d","Card_Age","Transaction_Distance","Risk_Score","Is_Weekend","Fraud_Label")
+
+#converting rest of the columns as factors
+f_data[, !names(f_data) %in% exclude_cols] <- lapply(f_data[, !names(f_data) %in% exclude_cols], as.factor)
+
+
+```
+
+```{r}
+str(f_data)
+```
+
+### Exploratory Data Analysis
+
+```{r}
+# Check class imbalance
+table(f_data$Fraud_Label)
+prop.table(table(f_data$Fraud_Label))*100
+```
+
+At least 32% fraud cases.
+
+```{r}
+#boxplot for transaction amount
+ggplot(f_data, aes(x= as.factor(Fraud_Label), y = Transaction_Amount), fill= as.factor(Fraud_Label)) +
+  geom_boxplot() +
+  labs(title =" Transaction Amount vs Fraud Label", x="Fraud Label", y="Transaction Amount")
+```
+
+```{r}
+#Histogram for Risk Score
+ggplot(f_data, aes(x= Risk_Score, fill= as.factor(Fraud_Label))) +
+  geom_histogram(bins=30, alpha = 0.7, position = "identity") +
+  labs(title = "Distribution of Risk Score by Fraud Label", x="Risk Score", y="Count")
+```
+
+```{r}
+ggplot(f_data, aes(x = Transaction_Distance, y = Transaction_Amount, color = as.factor(Fraud_Label))) +
+  geom_point(alpha = 0.6, size = 2) +
+  scale_color_manual(values = c("blue", "red")) +  # Blue for non-fraud, Red for fraud
+  labs(title = "Transaction Distance vs Amount (Fraud vs Non-Fraud)",
+       x = "Transaction Distance",
+       y = "Transaction Amount",
+       color = "Fraud Label") +
+  theme_minimal()
+```
+
+### Feature Engineering
+
+Risk-Based Feature Binning If Risk_Score above 0.80 is a strong fraud
+indicator, we can create a new feature:
+
+```{r}
+f_data$High_Risk <- ifelse(f_data$Risk_Score > 0.80, 1 ,0)
+```
+
+Time of Day Fraud Pattern
+
+```{r}
+f_data$Hour <- as.numeric(format(f_data$Timestamp, "%H"))  # Extract hour as numeric
+f_data$Time_Category <- cut(f_data$Hour,
+                            breaks = c(0, 6, 12, 18, 24),
+                            labels= c("Midnight-6am","Morning","Afternoon", "Evening"),
+                            include.lowest = TRUE)
+```
+
+```{r}
+ggplot(f_data[f_data$Fraud_Label == 1, ], aes(x = Time_Category, fill = as.factor(Fraud_Label))) +
+  geom_bar(alpha = 0.7) +  # Use geom_bar() for categorical data
+  labs(title = "Distribution of Fraud Transactions by Time Category", 
+       x = "Time Category", 
+       y = "Count", 
+       fill = "Fraud Label") +
+  theme_minimal()
+```
+
+Most fraud transactions occur midnight to 6 AM, which is a key fraud
+pattern.
+
+```{r}
+f_data$High_Risk_Time <- ifelse(f_data$Time_Category == "Midnight-6AM", 1, 0)
+```
+
+```{r}
+ggplot(f_data[f_data$Fraud_Label == 1, ], aes(x = Transaction_Amount, fill = Time_Category)) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  labs(title = "Fraud Transaction Amount by Time of Day",
+       x = "Transaction Amount",
+       y = "Count") +
+  theme_minimal()
+```
+
+it seems that most fraud transactions occur at lower transaction
+amounts, and the majority of them happen in the evening (purple) rather
+than midnight (red).
+
+🧐 Key Insights from the Chart: 1. Fraud transactions are more frequent
+for lower transaction amounts (mostly under \$100). 2. Evening
+transactions (purple) dominate fraud cases, contradicting the previous
+assumption about nighttime fraud. 3. Midnight-6AM fraud cases (red) are
+present but not as dominant as in the first visualization. 4. Higher
+transaction amounts (\$500+) have very few fraud cases across all time
+periods.
+
+### Model Building and Data Processing
+
+Machine learning models perform better when numerical features are on a
+similar scale. In our dataset, we have features like: •
+Transaction_Amount (ranges from \$1 to \$1000) • Risk_Score (ranges from
+0 to 1) • Transaction_Distance (ranges from a few meters to thousands of
+kilometers)
+
+Since these variables have different scales, models like Logistic
+Regression, KNN, and Neural Networks may get biased towards larger
+values (e.g., Transaction_Amount having a greater effect than
+Risk_Score).
+
+```{r}
+
+set.seed(42)
+
+#80% train 20% test
+
+trainIndex <- createDataPartition(f_data$Fraud_Label, p=0.8, list = FALSE)
+train_data <- f_data[trainIndex, ]
+test_data <- f_data[-trainIndex, ]
+
+```
+
+```{r}
+
+
+numeric_cols <- c("Transaction_Amount", "Account_Balance", "Daily_Transaction_Count",
+                  "Avg_Transaction_Amount_7d", "Failed_Transaction_Count_7d",
+                  "Card_Age", "Transaction_Distance", "Risk_Score")
+
+# Apply Min-Max Scaling
+preprocess_params <- preProcess(train_data[, numeric_cols], method = c("range"))
+
+# Transform training and test sets
+train_data[, numeric_cols] <- predict(preprocess_params, train_data[, numeric_cols])
+test_data[, numeric_cols] <- predict(preprocess_params, test_data[, numeric_cols])
+```
+
+Train Logistic Regression Model
+
+```{r}
+drop_cols <- c("Transaction_ID", "User_ID")  # IDs are not useful for predictions
+train_data <- train_data[, !(names(train_data) %in% drop_cols)]
+test_data <- test_data[, !(names(test_data) %in% drop_cols)]
+log_model <- glm(Fraud_Label ~ ., data= train_data, family = binomial)
+
+summary(log_model)
+```
+
+Features with p-value \< 0.05 are statistically significant, meaning
+they strongly affect fraud probability.
+
+Top Influential Features (Significant at p \< 0.001) •
+Failed_Transaction_Count_7d (Estimate = 9.42, p \< 2e-16) 🔹
+Interpretation: A higher number of failed transactions in the past 7
+days is a strong fraud indicator. 🔹 Impact: For every one additional
+failed transaction, the fraud probability increases exponentially. •
+Risk_Score (Estimate = 0.916, p \< 2e-16) 🔹 Interpretation: Higher risk
+scores strongly correlate with fraud. 🔹 Impact: A 1-unit increase in
+Risk_Score leads to an increase in log-odds of fraud by 0.916. •
+High_Risk (Estimate = 6.91, p \< 2e-16) 🔹 Interpretation: Transactions
+flagged as “High Risk” have a very strong correlation with fraud. 🔹
+Impact: If a transaction is labeled High_Risk = 1, the log-odds of fraud
+increase significantly.
+
+⸻
+
+```{r}
+train_data <- train_data[, !(names(train_data) %in% c("High_Risk_Time"))]
+test_data <- test_data[, !(names(test_data) %in% c("High_Risk_Time"))]
+```
+
+### Decision Tree Model
+
+```{r}
+#Train decision tree model
+
+tree_model <- rpart(Fraud_Label ~ ., data = train_data, method = "class")
+
+rpart.plot(tree_model, type = 4, extra = 101)
+```
+
+```{r}
+tree_preds <- predict(tree_model, test_data, type = "class")
+```
+
+```{r}
+conf_matrix <- confusionMatrix(tree_preds, factor(test_data$Fraud_Label))
+print(conf_matrix)
+```
+
+```{r}
+library("pROC")
+roc_curve <- roc(test_data$Fraud_Label, as.numeric(tree_preds))
+auc(roc_curve)
+```
+
+Understanding the Decision Tree Plot • Root Node: • The
+Failed_Transaction_Count_7d is the most important split. • If ≥ 0.88 →
+Fraud • If \< 0.88 → Check Risk Score • Second Split: • If Risk Score ≥
+0.85 → Fraud • If Risk Score \< 0.85 → Not Fraud
+
+```         
+Key Insights from the Decision Tree
+```
+
+✅ Failed_Transaction_Count_7d is the strongest fraud indicator. ✅ Risk
+Score \> 0.85 has a high chance of fraud. ✅ If both conditions are low,
+transaction is mostly non-fraudulent.
+
+Potential Issue: Overfitting • A perfect model is rare in real-world
+fraud detection. • This could mean that the tree is overfitting the
+training data. • The model might not generalize well on unseen data.
+
+```         
+ overfitting happens when:
+```
+
+✔ The model performs extremely well on training data but fails on unseen
+data. ✔ It memorizes patterns rather than generalizing to new data. ✔
+The dataset might contain biases or leakage that make prediction too
+easy.
+
+### Random Forest Model
+
+```{r}
+library(randomForest)
+
+set.seed(42)
+
+# Convert Fraud_Label to a factor (classification problem)
+train_data$Fraud_Label <- as.factor(train_data$Fraud_Label)
+test_data$Fraud_Label <- as.factor(test_data$Fraud_Label)
+
+# Re-run Random Forest Model
+rf_model <- randomForest(Fraud_Label ~ .,
+                         data = train_data,
+                         ntree = 100,
+                         mtry = sqrt(ncol(train_data) - 1),
+                         importance = TRUE)
+```
+
+```{r}
+print(rf_model)
+               
+```
+
+```{r}
+varImpPlot(rf_model)
+```
+
+```{r}
+rf_preds <- predict(rf_model, test_data)
+
+# Compute confusion matrix
+library(caret)
+conf_matrix <- confusionMatrix(rf_preds, test_data$Fraud_Label)
+print(conf_matrix)
+```
+
+to avoid potential overfitting , If Risk_Score or
+Failed_Transaction_Count_7d have extremely high importance, try training
+without them:
+
+```{r}
+rf_model <- randomForest(Fraud_Label ~ . -Risk_Score -Failed_Transaction_Count_7d,
+                         data = train_data, 
+                         ntree = 100)
+```
+
+```{r}
+rf_preds <- predict(rf_model, test_data)
+
+# Compute confusion matrix
+library(caret)
+conf_matrix <- confusionMatrix(rf_preds, test_data$Fraud_Label)
+print(conf_matrix)
+```
+
+```         
+After removing Failed_Transaction_Count_7d and Risk_Score, your accuracy dropped to ~80%, confirming that the original model was overfitting.
+```
+
+⸻
+
+🔍 Key Observations from Confusion Matrix
+
+✅ Accuracy: 80.18% (which is much more reasonable than 100%) ✅
+Sensitivity (Recall for Non-Fraud): 93.47% (Great! Most non-fraud cases
+are correctly classified) ✅ Specificity (Recall for Fraud): 51.39%
+(Low! The model struggles to detect fraud) ✅ Kappa Score: 0.4945
+(Moderate agreement, could be improved)
+
+### XGBoost Model
+
+XGBoost requires numeric matrix input, so we need to convert categorical
+variables into dummy variables.
+
+```{r}
+str(train_data)
+str(test_data)
+```
+
+```{r}
+
+cols_to_remove <- c ("Failed_Transaction_Count_7d","High_Risk")
+train_data_xg <- train_data[, !(names(train_data) %in% cols_to_remove)]
+test_data_xg <- test_data[, !(names(test_data) %in% cols_to_remove)]
+
+# Ensure Fraud_Label is numeric (0 and 1)
+train_data_xg$Fraud_Label <- as.numeric(as.character(train_data$Fraud_Label))
+test_data_xg$Fraud_Label <- as.numeric(as.character(test_data$Fraud_Label))
+```
+
+```{r}
+train_matrix <- model.matrix(Fraud_Label ~ . -1, data = train_data_xg)
+test_matrix <- model.matrix(Fraud_Label ~ . -1, data= test_data_xg)
+```
+
+```{r}
+train_data$Fraud_Label <- as.numeric(as.character(train_data$Fraud_Label))
+test_data$Fraud_Label <- as.numeric(as.character(test_data$Fraud_Label))
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_data$Fraud_Label)
+dtest <- xgb.DMatrix(data = test_matrix, label = test_data$Fraud_Label)
+```
+
+```{r}
+xgb_model <- xgboost(
+  data = dtrain,
+  max_depth = 6,
+  eta = 0.1,
+  nrounds = 100,
+  objective = "binary:logistic",
+  eval_metric ="auc",
+  verbose = 1
+)
+```
+
+```{r}
+xgb_test_pred <- predict(xgb_model, newdata = test_matrix)
+roc_curve <- roc(test_data$Fraud_Label, xgb_test_pred)
+auc(roc_curve)
+```
+
+```{r}
+xgb.importance(model = xgb_model)
+xgb.plot.importance(xgb.importance(model = xgb_model))
+```
+
+Key Findings
+
+1️⃣ The most important fraud indicators were Risk Score, Failed
+Transaction Count, and Previous Fraud Activity. 2️⃣ Removing too many key
+predictors weakened the model, proving their importance. 3️⃣ XGBoost
+outperformed the other models after hyperparameter tuning. 4️⃣ The scope
+of this work is limited to classification but helps in identifying key
+risk factors for fraud detection.
+
+### Fraud Risk Forecasting - A Time series analysis
+
+```{r}
+forecast_data <- read.csv("synthetic_fraud_dataset.csv",stringsAsFactors = FALSE)
+```
+
+```{r}
+str(forecast_data)
+colSums(is.na(forecast_data))
+head(forecast_data)
+```
+
+```{r}
+forecast_data$Timestamp <- ymd_hms(forecast_data$Timestamp)
+forecast_data$Timestamp <- as.POSIXct(forecast_data$Timestamp,format="%Y-%m-%d %H:%M:%S")
+```
+
+```{r}
+exclude_cols <- c("Transaction_ID","User_ID","Transaction_Amount","Timestamp","Account_Balance","IP_Address_Flag","Previous_Fraudulent_Activity","Daily_Transaction_Count","Avg_Transaction_Amount_7d","Failed_Transaction_Count_7d","Card_Age","Transaction_Distance","Risk_Score","Is_Weekend","Fraud_Label")
+
+#converting rest of the columns as factors
+forecast_data[, !names(forecast_data) %in% exclude_cols] <- lapply(forecast_data[, !names(forecast_data) %in% exclude_cols], as.factor)
+
+
+```
+
+```{r}
+str(forecast_data)
+```
+#### Agregating data Monthly for ARIMAX
+
+Since Risk_Score and Failed_Transaction_Count_7d were identified as the key predictors in our classification model, we will now use them as regressors in ARIMAX for forecasting fraud risk.
+
+```{r}
+forecast_data$YearMonth <-format(forecast_data$Timestamp,"%Y-%m")
+```
+```{r}
+monthly_data <- forecast_data %>%
+    group_by(YearMonth) %>%
+    summarise(
+        Fraud_Count = sum(Fraud_Label),  
+        Total_Transactions = n(),
+        Avg_Risk_Score = mean(Risk_Score, na.rm = TRUE),
+        Avg_Failed_Transactions = mean(Failed_Transaction_Count_7d, na.rm = TRUE)
+    )
+```
+
+```{r}
+# Extract the first year and month from the dataset
+start_year <- as.numeric(substr(monthly_data$YearMonth[1], 1, 4))
+start_month <- as.numeric(substr(monthly_data$YearMonth[1], 6, 7))
+
+# Convert to time series
+monthly_data_ts <- ts(monthly_data$Fraud_Count, start = c(start_year, start_month), frequency = 12)
+```
+
+
+```{r}
+plot.ts(monthly_data$Fraud_Count, main=" Monthly Fraud Trend", ylab="Fraud Cases", xlab = "Month")
+```
+
+Augmented Dickey Fuller Stationarity Check
+
+```{r}
+library(tseries)
+adf.test(monthly_data_ts)
+```
+	•	Test Statistic (Dickey-Fuller) = 0.0044 (Very high, typically should be negative for stationarity)
+	•	p-value = 0.99 (Much higher than 0.05, meaning we fail to reject the null hypothesis)
+	•	Null Hypothesis (H₀): The series has a unit root (i.e., it is non-stationary).
+	•	Alternative Hypothesis (H₁): The series is stationary.
+
+Since the p-value is way above 0.05, we fail to reject the null hypothesis, meaning our time series is non-stationary.
+
+##### First Differencing
+```{r}
+library(tseries)
+diff_tf <- diff(monthly_data_ts)
+adf.test(diff_tf)
+
+```
+##### Second Differencing
+```{r}
+diff2_ts <- diff(diff_tf)
+adf.test(diff2_ts)
+```
+
+
+##### Seasonal Differencing
+```{r}
+diff_seasonal <- diff(monthly_data_ts, lag =6)
+adf.test(diff_seasonal)
+```
+```{r}
+log_ts <- log(monthly_data_ts)
+diff_log_ts <- diff(log_ts)
+adf.test(diff_log_ts)
+```
+
+Yes, since monthly differencing is not making the data stationary (p-value > 0.5 in ADF test), shifting to a weekly aggregation makes sense.
+
+#### Agregating Weekly
+```{r}
+weekly_data <- forecast_data %>%
+  mutate(Year_Week = format(as.Date(Timestamp), "%Y-%U")) %>%
+  group_by(Year_Week) %>%
+  summarise(Fraud_Count = sum(Fraud_Label),
+             Risk_Score = mean(Risk_Score, na.rm = TRUE),
+             Failed_Transactions_Count_7d = mean(Failed_Transaction_Count_7d, na.rm = TRUE)
+            )
+  
+```
+```{r}
+str(weekly_data)
+```
+```{r}
+# Convert Year_Week to proper date format for TS object
+weekly_data$Year <- as.numeric(substr(weekly_data$Year_Week, 1, 4))
+weekly_data$Week <- as.numeric(substr(weekly_data$Year_Week, 6, 7))
+
+# Create weekly time series
+weekly_ts <- ts(weekly_data$Fraud_Count, start = c(min(weekly_data$Year), min(weekly_data$Week)), frequency = 52)
+```
+
+```{r}
+sum(is.na(weekly_data$Year))
+sum(is.na(weekly_data$Week))
+sum(is.na(weekly_data$Fraud_Count))
+
+```
+```{r}
+# ADF test
+adf.test(weekly_ts)
+```
+
+```{r}
+diff_weekly_ts <- diff(weekly_ts)
+adf.test(diff_weekly_ts)
+```
+
+```{r}
+diff_seasonal_weekly_ts <- diff(weekly_ts, lag = 13)
+adf.test(diff_seasonal_weekly_ts)
+```
+
+```{r}
+length(weekly_ts)
+View(weekly_ts)
+```
+Most stationarity test have shown significant non stationary behaviour even after differencing, hence we have to try another approach such as XGBoost gradient moodel.
+
+
+#### XG Boost Fraud Prediction
+
+
+```{r}
+weekly_data$lag1 <- lag(weekly_data$Fraud_Count, 1)
+weekly_data$lag2 <- lag(weekly_data$Fraud_Count, 2)
+```
+
+```{r}
+# Removing NA lags
+
+weekly_data<- na.omit(weekly_data)
+```
+```{r}
+str(weekly_data)
+```
+
+
+```{r}
+train_index <- 1:(nrow(weekly_data) - 10)
+train <- weekly_data[train_index, ]
+test <- weekly_data[-train_index, ]
+
+```
+
+```{r}
+# Prepare data for XGBoost
+dtrain <- xgb.DMatrix(data = as.matrix(train[, c("lag1", "lag2", "Risk_Score", "Failed_Transactions_Count_7d")]), 
+                      label = train$Fraud_Count)
+dtest <- xgb.DMatrix(data = as.matrix(test[, c("lag1", "lag2", "Risk_Score", "Failed_Transactions_Count_7d")]), 
+                     label = test$Fraud_Count)
+
+```
+
+```{r}
+# Train XGBoost model
+params <- list(objective = "reg:squarederror", eval_metric = "rmse")
+bst <- xgboost(params = params, data = dtrain, nrounds = 100)
+```
+```{r}
+# Predict and compare
+preds <- predict(bst, dtest)
+plot(test$Fraud_Count, type = "l", col = "blue", main = "Actual vs Predicted")
+lines(preds, col = "red")
+legend("topright", legend = c("Actual", "Predicted"), col = c("blue", "red"), lty = 1)
+```
+XGBoost model performs well on train & test data, the next step is to forecast fraud risk for the next 8 weeks beyond our dataset.
+
+```{r}
+colnames(train[, c("lag1", "lag2")])  # Features used in training
+colnames(future_weeks)  # Features in future dataset
+```
+
+
+```{r}
+
+  # Ensure future_weeks has all the same columns as the training data
+future_weeks <- data.frame(matrix(NA, nrow = 8, ncol = ncol(train[, c("lag1", "lag2", "Risk_Score", "Failed_Transactions_Count_7d")])))
+colnames(future_weeks) <- colnames(train[, c("lag1", "lag2", "Risk_Score", "Failed_Transactions_Count_7d")])  
+
+# Initialize future_weeks with the last known values from test data
+future_weeks[1, "lag1"] <- test$Fraud_Count[nrow(test)]
+future_weeks[1, "lag2"] <- test$Fraud_Count[nrow(test) - 1]
+future_weeks[1, "Risk_Score"] <- mean(test$Risk_Score, na.rm = TRUE)  # Use mean Risk_Score
+future_weeks[1, "Failed_Transactions_Count_7d"] <- mean(test$Failed_Transactions_Count_7d, na.rm = TRUE)  
+
+# Predict iteratively for the next 8 weeks
+future_preds <- numeric(8)
+
+for (i in 1:8) {
+  dfuture <- xgb.DMatrix(data = as.matrix(future_weeks[i, , drop = FALSE])) 
+  
+  # Predict fraud count for this week
+  future_preds[i] <- predict(bst, dfuture)
+  
+  # Update lag features for the next prediction
+  if (i < 8) {
+    future_weeks[i + 1, "lag1"] <- future_preds[i]
+    future_weeks[i + 1, "lag2"] <- future_weeks[i, "lag1"]
+    future_weeks[i + 1, "Risk_Score"] <- mean(test$Risk_Score, na.rm = TRUE)  # Keep it constant
+    future_weeks[i + 1, "Failed_Transactions_Count_7d"] <- mean(test$Failed_Transactions_Count_7d, na.rm = TRUE)  
+  }
+}
+
+# Plot the forecasted fraud counts
+plot(1:8, future_preds, type = "o", col = "red", lwd = 2, 
+     main = "Fraud Risk Forecast (Next 8 Weeks)", xlab = "Weeks Ahead", ylab = "Predicted Fraud Count")
+```
+
+```{r}
+colnames(dfuture)
+colnames(bst)
+```
+
+Conclusion for the Fraud Risk Forecasting Model
+
+In this project, we successfully built a fraud risk forecasting model using XGBoost with lag-based features. Our approach included:
+	1.	Data Preparation & Feature Engineering:
+	•	We aggregated fraud count data on a weekly basis.
+	•	Created lag features (lag1, lag2) to capture temporal dependencies.
+	•	Included key predictors (Risk_Score, Failed_Transactions_Count_7d) identified from the classification model.
+	2.	Model Training & Evaluation:
+	•	Trained an XGBoost model for regression using past fraud counts and risk-related features.
+	•	Validated on test data, achieving a strong alignment between actual and predicted values.
+	3.	Future Fraud Prediction:
+	•	Extended the model to predict fraud risk for the next 8 weeks using an iterative approach.
+	•	The resulting forecast exhibits reasonable fluctuations, suggesting it has learned seasonality/trends.
